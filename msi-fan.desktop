@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MSI ファン制御
+Name[en]=MSI Fan Control
+Comment=ファンカーブと Cooler Boost の設定
+Comment[en]=Fan curve and Cooler Boost settings
+Exec=/usr/local/bin/msi-fan-gui
+Icon=msi-fan
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+StartupWMClass=msi-fan

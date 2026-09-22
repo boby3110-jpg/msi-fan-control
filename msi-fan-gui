@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+"""MSI ファン制御 GUI — MSI Prestige 13 Evo A12M (EC 13Q1EMS1) 向け
+
+⚠️ ファンカーブの読み書きは msi-ec が公開していない EC の生レジスタ
+（0x6a-0x6f / 0x72-0x77）に対して行う。番地の配置は上記機種でのみ実測で
+確認している。他機種では msi-fan-helper が機種ガードで拒否する。
+
+読み取りは sysfs から直接（無権限）。書き込みのみ pkexec でヘルパーに委譲する。
+Wayland では root で GUI を起動できないため、この分離が必要。
+"""
+import json
+import os
+import statistics
+from collections import deque
+import re
+import subprocess
+import sys
+
+from PyQt6.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QPointF
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+    QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QSystemTrayIcon,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+)
+
+D = "/sys/devices/platform/msi-ec"
+POWER_FILE = "/run/msi-fan/power"   # 監視デーモンが公開する実測消費電力
+def _find_battery():
+    """電池の sysfs パス。BAT0 か BAT1 かは機種で違うので type で探す。"""
+    import glob
+    for p in sorted(glob.glob("/sys/class/power_supply/*")):
+        try:
+            with open(f"{p}/type") as f:
+                if f.read().strip() == "Battery":
+                    return p
+        except OSError:
+            pass
+    return "/sys/class/power_supply/BAT0"
+
+
+BAT = _find_battery()
+# 運用上よく使う充電上限。60=普段、80=外出前、100=残量計の較正時。
+CHARGE_PRESETS = [(60, "60% 普段"), (80, "80% 外出前"), (100, "100% 較正")]
+# 0xd2 の既定値 0xc0。msi-ec の一覧にないので shift_mode は "unknown (192)"
+# と読めるが、実測では turbo と同等だった。
+DEFAULT_SHIFT = "デフォルト"
+ICON_SIZES = (16, 22, 24, 32, 48, 64, 128, 256, 512)
+ICON_DIR = "/usr/share/icons/hicolor/{0}x{0}/apps/msi-fan.png"
+HELPER = "/usr/local/bin/msi-fan-helper"
+TEMP_ADDRS = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F]
+SPEED_ADDRS = [0x72, 0x73, 0x74, 0x75, 0x76, 0x77]
+
+T_MIN, T_MAX = 30, 105
+
+# EC は「現在温度以上で最初に来る温度点」の速度を出す（実測で確認）。
+# 最終温度点より上は制御対象外になるため、必ず 100℃ まで覆うこと。
+PRESETS = {
+    "静音重視":   ([55, 68, 78, 86, 93, 100], [0, 20, 35, 50, 70, 90]),
+    "デフォルト": ([50, 60, 70, 80, 90, 95],  [0, 40, 50, 70, 70, 70]),
+    "冷却重視":   ([50, 60, 70, 80, 90, 100], [0, 35, 55, 75, 90, 100]),
+    # 低温帯でも回し続けて静止状態からの起動を避け、高速側を左に寄せて先回りさせる
+    "立ち上がり重視": ([45, 55, 65, 75, 85, 100], [25, 45, 65, 85, 100, 100]),
+    # 低負荷は完全停止で無音、高温域だけ全力。自動 Cooler Boost と組で使う想定
+    "静音⇄全力":  ([60, 70, 78, 86, 94, 100], [0, 35, 65, 90, 100, 100]),
+}
+
+
+def read_sysfs(name, default="—"):
+    try:
+        with open(f"{D}/{name}") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def app_icon():
+    """インストール済みの PNG を直接読み込む。
+
+    QIcon.fromTheme はプラットフォームテーマが載っていない場面で
+    テーマ名を持たず Null を返すことがあり、そうなると
+    setWindowIcon が無効になってウィンドウのアイコンが既定のままになる。
+    """
+    icon = QIcon()
+    for sz in ICON_SIZES:
+        path = ICON_DIR.format(sz)
+        if os.path.exists(path):
+            icon.addFile(path, QSize(sz, sz))
+    return icon if not icon.isNull() else QIcon.fromTheme("msi-fan")
+
+
+def read_battery():
+    """充電しきい値と電池の状態。
+
+    charge_control_start_threshold は msi-ec 内で end-10 を返すだけの
+    派生値なので扱わない。実体のある設定は end 側だけ。
+    """
+    def n(name):
+        try:
+            with open(f"{BAT}/{name}") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return 0
+
+    try:
+        with open(f"{BAT}/status") as f:
+            status = f.read().strip()
+    except OSError:
+        status = "—"
+    full, design = n("charge_full"), n("charge_full_design")
+    return {
+        "charge_now": n("charge_now"),
+        "current": n("current_now"),
+        "voltage": n("voltage_now"),
+        "limit": n("charge_control_end_threshold"),
+        "capacity": n("capacity"),
+        "status": status,
+        "full": full,
+        "design": design,
+        "health": full / design * 100 if design else 0,
+    }
+
+
+def battery_ring_icon(base, capacity, limit, status):
+    """アプリアイコンの周囲に充電率のリングを描いたトレイ用アイコン。
+
+    トレイは 22〜32px で表示されるため、隅に小さな円グラフを置いても潰れる。
+    外周をリングにすれば同じ面積でも角度で読める。アプリ内のゲージと同じく
+    「充電上限より先」を沈めて描き、60% で止まるのが異常でないことを示す。
+    """
+    # pen_w を上げるほどリングは読みやすくなるが、その分ベースアイコンが
+    # 小さくなる。12/64 が視認性と識別性の折り合い点（実機で確認）。
+    size, pen_w = 64, 12
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    inset = pen_w + 2
+    base.paint(p, inset, inset, size - 2 * inset, size - 2 * inset)
+
+    rect = QRectF(pen_w / 2 + 1, pen_w / 2 + 1,
+                  size - pen_w - 2, size - pen_w - 2)
+    top = 90 * 16                      # 12時位置から時計回り
+
+    track = QColor("#8a8a8a"); track.setAlpha(70)
+    p.setPen(QPen(track, pen_w, cap=Qt.PenCapStyle.FlatCap))
+    p.drawArc(rect, 0, 360 * 16)
+
+    if limit < 100:                    # 充電されない領域
+        dead = QColor("#e8663d"); dead.setAlpha(80)
+        p.setPen(QPen(dead, pen_w, cap=Qt.PenCapStyle.FlatCap))
+        p.drawArc(rect, top - int(360 * 16 * limit / 100),
+                  -int(360 * 16 * (100 - limit) / 100))
+
+    if capacity > 0:
+        if status == "Charging":
+            fill = QColor("#4caf7d")
+        elif capacity <= 20:
+            fill = QColor("#e8663d")
+        else:
+            fill = QColor("#3d9ae8")
+        p.setPen(QPen(fill, pen_w, cap=Qt.PenCapStyle.FlatCap))
+        p.drawArc(rect, top, -int(360 * 16 * capacity / 100))
+
+    p.end()
+    return QIcon(pm)
+
+
+def shift_label(raw):
+    """性能モードの表示名。0xc0 は既定値なので unknown ではなくそう見せる。"""
+    if raw.startswith("unknown"):
+        return DEFAULT_SHIFT if "(192)" in raw else raw
+    return (raw.split() or ["—"])[0]
+
+
+def read_power():
+    """CPU の実測消費電力。
+
+    性能モードは RAPL の上限値を書き換えずに実電力を抑えるため、
+    上限値を見ても効果が分からない。実測値でしか判定できない。
+    energy_uj は root 専用なので、デーモンが公開した値を読む。
+    """
+    try:
+        with open(POWER_FILE) as f:
+            return f"{float(f.read().strip()):.1f} W"
+    except (OSError, ValueError):
+        return "—"
+
+
+def read_ec_dump():
+    """ec_dump を丸ごと読んで {番地: 値} にする。ec_get と違い競合しない。"""
+    data = {}
+    try:
+        with open(f"{D}/debug/ec_dump") as f:
+            for line in f:
+                m = re.match(r"\|\s*0x([0-9a-f])_\s*\|\s*((?:[0-9a-f]{2}\s+){16})", line)
+                if m:
+                    hi = int(m.group(1), 16)
+                    for lo, v in enumerate(m.group(2).split()):
+                        data[hi * 16 + lo] = int(v, 16)
+    except OSError:
+        pass
+    return data
+
+
+def read_curve():
+    d = read_ec_dump()
+    if not all(a in d for a in TEMP_ADDRS + SPEED_ADDRS):
+        return None
+    return [d[a] for a in TEMP_ADDRS], [d[a] for a in SPEED_ADDRS]
+
+
+def run_helper(*args):
+    """pkexec 経由でヘルパーを呼ぶ。成功なら None、失敗ならメッセージを返す。"""
+    try:
+        p = subprocess.run(["pkexec", HELPER, *args],
+                           capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        return "pkexec が見つかりません（sudo apt install pkexec）"
+    except subprocess.TimeoutExpired:
+        return "ヘルパーが応答しません"
+    if p.returncode == 126:
+        return None          # 利用者が認証をキャンセルした
+    if p.returncode != 0:
+        return p.stderr.strip() or f"終了コード {p.returncode}"
+    return None
+
+
+class BatteryBar(QWidget):
+    """0〜100% 固定目盛りの充電ゲージ。
+
+    現在の充電率に加えて充電上限も同じ物差しの上に描く。上限より右は
+    「充電されない領域」なので沈めて表示し、なぜ満充電にならないのかが
+    一目で分かるようにする。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.capacity = 0
+        self.limit = 100
+        self.status = ""
+        self.setMinimumHeight(78)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_state(self, capacity, limit, status):
+        self.capacity, self.limit, self.status = capacity, limit, status
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        fg = self.palette().windowText().color()
+        m, bar_h = 12, 30
+        x0, w = m, self.width() - 2 * m
+        y0 = 26
+        if w <= 0:
+            return
+
+        def px(pct):
+            return x0 + w * max(0, min(100, pct)) / 100
+
+        track = QColor(fg); track.setAlpha(28)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(x0, y0, w, bar_h, 5, 5)
+
+        # 上限より右＝充電されない領域
+        if self.limit < 100:
+            dead = QColor("#e8663d"); dead.setAlpha(30)
+            p.setBrush(dead)
+            p.drawRoundedRect(int(px(self.limit)), y0,
+                              int(px(100) - px(self.limit)), bar_h, 5, 5)
+
+        # 充電量
+        if self.capacity > 0:
+            if self.status == "Charging":
+                fill = QColor("#4caf7d")
+            elif self.capacity <= 20:
+                fill = QColor("#e8663d")
+            else:
+                fill = QColor("#3d9ae8")
+            p.setBrush(fill)
+            p.drawRoundedRect(x0, y0, max(6, int(px(self.capacity) - x0)), bar_h, 5, 5)
+
+        # 上限マーカー
+        if self.limit < 100:
+            xl = int(px(self.limit))
+            p.setPen(QPen(QColor("#e8663d"), 2))
+            p.drawLine(xl, y0 - 6, xl, y0 + bar_h + 6)
+            f = QFont(); f.setPointSize(8); f.setBold(True); p.setFont(f)
+            p.drawText(xl + 4, y0 - 10, f"上限 {self.limit}%")
+
+        # 目盛り
+        grid = QColor(fg); grid.setAlpha(90)
+        f = QFont(); f.setPointSize(8); p.setFont(f)
+        for t in (0, 25, 50, 75, 100):
+            xt = int(px(t))
+            p.setPen(QPen(grid, 1))
+            p.drawLine(xt, y0 + bar_h + 2, xt, y0 + bar_h + 6)
+            p.drawText(xt - (14 if t == 100 else 6), y0 + bar_h + 20, f"{t}")
+
+        # 現在値
+        f = QFont(); f.setPointSize(13); f.setBold(True); p.setFont(f)
+        p.setPen(fg)
+        p.drawText(x0, y0 - 8, f"{self.capacity}%")
+
+
+class CurveWidget(QWidget):
+    """ドラッグで編集できるファンカーブ。"""
+    changed = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.temps = list(PRESETS["デフォルト"][0])
+        self.speeds = list(PRESETS["デフォルト"][1])
+        self.cur_temp = None
+        self.cur_speed = None
+        self.drag = None
+        self.setMinimumSize(360, 150)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+
+    # --- 座標変換 ---
+    def _rect(self):
+        m_l, m_r, m_t, m_b = 52, 16, 16, 34
+        return m_l, m_t, self.width() - m_l - m_r, self.height() - m_t - m_b
+
+    def _to_px(self, t, s):
+        x0, y0, w, h = self._rect()
+        return QPointF(x0 + (t - T_MIN) / (T_MAX - T_MIN) * w, y0 + (1 - s / 100) * h)
+
+    def _from_px(self, pos):
+        x0, y0, w, h = self._rect()
+        t = T_MIN + (pos.x() - x0) / w * (T_MAX - T_MIN)
+        s = (1 - (pos.y() - y0) / h) * 100
+        return t, s
+
+    # --- 操作 ---
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        for i in range(6):
+            if (self._to_px(self.temps[i], self.speeds[i]) - e.position()).manhattanLength() < 18:
+                self.drag = i
+                return
+
+    def mouseReleaseEvent(self, e):
+        self.drag = None
+
+    def mouseMoveEvent(self, e):
+        if self.drag is None:
+            return
+        i = self.drag
+        t, s = self._from_px(e.position())
+        lo = self.temps[i - 1] + 1 if i > 0 else T_MIN
+        hi = self.temps[i + 1] - 1 if i < 5 else T_MAX
+        self.temps[i] = max(lo, min(hi, round(t)))
+        s_lo = self.speeds[i - 1] if i > 0 else 0
+        s_hi = self.speeds[i + 1] if i < 5 else 100
+        self.speeds[i] = max(s_lo, min(s_hi, round(s)))
+        self.changed.emit()
+        self.update()
+
+    def set_curve(self, temps, speeds):
+        self.temps, self.speeds = list(temps), list(speeds)
+        self.update()
+
+    # --- 描画 ---
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = self.palette()
+        fg = pal.windowText().color()
+        x0, y0, w, h = self._rect()
+
+        grid = QColor(fg); grid.setAlpha(38)
+        p.setPen(QPen(grid, 1))
+        f = QFont(); f.setPointSize(8); p.setFont(f)
+        label = QColor(fg); label.setAlpha(150)
+        for s in range(0, 101, 20):
+            y = y0 + (1 - s / 100) * h
+            p.setPen(QPen(grid, 1)); p.drawLine(int(x0), int(y), int(x0 + w), int(y))
+            p.setPen(label); p.drawText(4, int(y) + 4, f"{s:3d} %")
+        for t in range(30, 106, 10):
+            x = x0 + (t - T_MIN) / (T_MAX - T_MIN) * w
+            p.setPen(QPen(grid, 1)); p.drawLine(int(x), int(y0), int(x), int(y0 + h))
+            p.setPen(label); p.drawText(int(x) - 12, int(y0 + h) + 18, f"{t}℃")
+
+        # 最終温度点より上は EC のカーブが効かない領域（実測で確認）
+        if self.temps[5] < T_MAX:
+            xu = self._to_px(self.temps[5], 0).x()
+            warn = QColor("#e8663d"); warn.setAlpha(45)
+            p.fillRect(int(xu), int(y0), int(x0 + w - xu), int(h), warn)
+            p.setPen(QColor("#e8663d"))
+            p.drawText(int(xu) + 6, int(y0 + h) - 6, "制御対象外")
+
+        # 現在温度
+        if self.cur_temp is not None and T_MIN <= self.cur_temp <= T_MAX:
+            x = self._to_px(self.cur_temp, 0).x()
+            hot = QColor("#e8663d")
+            p.setPen(QPen(hot, 2))
+            p.drawLine(int(x), int(y0), int(x), int(y0 + h))
+            p.drawText(int(x) + 5, int(y0) + 13, f"{self.cur_temp}℃")
+
+        # 報告回転数
+        if self.cur_speed is not None:
+            y = self._to_px(0, self.cur_speed).y()
+            c = QColor("#3d9ae8")
+            p.setPen(QPen(c, 1, Qt.PenStyle.DashLine))
+            p.drawLine(int(x0), int(y), int(x0 + w), int(y))
+
+        # カーブ。EC は「現在温度の次にある温度点」の速度を使うので階段状に描く。
+        # つまり speed[i] が効くのは temp[i-1] 以上 temp[i] 未満の区間。
+        accent = QColor("#4caf7d")
+        left = T_MIN
+        for i in range(6):
+            y = self._to_px(0, self.speeds[i]).y()
+            xa = self._to_px(left, 0).x()
+            xb = self._to_px(self.temps[i], 0).x()
+            p.setPen(QPen(accent, 2))
+            p.drawLine(int(xa), int(y), int(xb), int(y))
+            if i < 5:
+                y2 = self._to_px(0, self.speeds[i + 1]).y()
+                p.drawLine(int(xb), int(y), int(xb), int(y2))
+            left = self.temps[i]
+        # 最終点より上の温度域は挙動未確認のため点線
+        y = self._to_px(0, self.speeds[5]).y()
+        p.setPen(QPen(accent, 2, Qt.PenStyle.DotLine))
+        p.drawLine(int(self._to_px(self.temps[5], 0).x()), int(y),
+                   int(self._to_px(T_MAX, 0).x()), int(y))
+        for i in range(6):
+            pt = self._to_px(self.temps[i], self.speeds[i])
+            p.setBrush(accent if self.drag != i else QColor("#ffffff"))
+            p.setPen(QPen(accent, 2))
+            p.drawEllipse(pt, 6, 6)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MSI ファン制御 — Prestige 13Evo A12M")
+        root = QWidget()
+        outer = QVBoxLayout(root)
+
+        # 状態表示
+        box = QGroupBox("現在の状態")
+        g = QGridLayout(box)
+        self.lbl = {}
+        items = [("温度", "temp"), ("報告回転", "fan"), ("ファンモード", "mode"),
+                 ("Cooler Boost", "boost"), ("性能モード", "shift"),
+                 ("消費電力", "power")]
+        for col, (title, key) in enumerate(items):
+            cap = QLabel(title); cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            capf = cap.font(); capf.setPointSize(8); cap.setFont(capf)
+            val = QLabel("—"); val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            vf = val.font(); vf.setPointSize(15); vf.setBold(True); val.setFont(vf)
+            g.addWidget(cap, 0, col); g.addWidget(val, 1, col)
+            self.lbl[key] = val
+        outer.addWidget(box)
+
+        # 状態タイルは共通、以下の詳細をタブで分ける
+        tabs = QTabWidget()
+        fan_page = QWidget(); fan = QVBoxLayout(fan_page)
+        bat_page = QWidget(); bat = QVBoxLayout(bat_page)
+        tabs.addTab(fan_page, "ファン")
+        tabs.addTab(bat_page, "バッテリー")
+        outer.addWidget(tabs)
+
+        # カーブ
+        cbox = QGroupBox("ファンカーブ — 各段は「その温度に達するまでの区間で出す速度」")
+        cl = QVBoxLayout(cbox)
+        self.curve = CurveWidget()
+        self.curve.changed.connect(self.curve_to_spins)
+        cl.addWidget(self.curve)
+
+        sg = QGridLayout()
+        sg.addWidget(QLabel("この温度まで"), 0, 0)
+        sg.addWidget(QLabel("その間の速度"), 1, 0)
+        sg.addWidget(QLabel("効く温度帯"), 2, 0)
+        self.t_spin, self.s_spin, self.band_lbl = [], [], []
+        for i in range(6):
+            ts = QSpinBox(); ts.setRange(T_MIN, T_MAX); ts.setSuffix(" ℃")
+            ss = QSpinBox(); ss.setRange(0, 100); ss.setSuffix(" %")
+            ts.valueChanged.connect(self.spins_to_curve)
+            ss.valueChanged.connect(self.spins_to_curve)
+            bl = QLabel("—"); bl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            bf = bl.font(); bf.setPointSize(8); bl.setFont(bf)
+            sg.addWidget(ts, 0, i + 1); sg.addWidget(ss, 1, i + 1)
+            sg.addWidget(bl, 2, i + 1)
+            self.t_spin.append(ts); self.s_spin.append(ss); self.band_lbl.append(bl)
+        cl.addLayout(sg)
+
+        pr = QHBoxLayout()
+        pr.addWidget(QLabel("プリセット:"))
+        for name in PRESETS:
+            b = QPushButton(name)
+            b.clicked.connect(lambda _, n=name: self.load_preset(n))
+            pr.addWidget(b)
+        pr.addStretch()
+        cl.addLayout(pr)
+        fan.addWidget(cbox)
+
+        # 操作
+        act = QHBoxLayout()
+        self.btn_apply = QPushButton("適用")
+        self.btn_save = QPushButton("適用して起動時にも反映")
+        self.btn_stock = QPushButton("カーブをデフォルトに戻す")
+        self.btn_reload = QPushButton("EC から再読込")
+        self.btn_apply.clicked.connect(lambda: self.apply(save=False))
+        self.btn_save.clicked.connect(lambda: self.apply(save=True))
+        self.btn_stock.clicked.connect(self.to_stock)
+        self.btn_reload.clicked.connect(self.reload_curve)
+        for b in (self.btn_apply, self.btn_save, self.btn_stock, self.btn_reload):
+            act.addWidget(b)
+        fan.addLayout(act)
+
+        # モード類
+        mbox = QGroupBox("モード")
+        ml = QHBoxLayout(mbox)
+        self.boost_btn = QPushButton("Cooler Boost を入れる")
+        self.boost_btn.setCheckable(True)
+        self.boost_btn.setMinimumWidth(210)   # 文言が変わっても幅が動かないように
+        self.boost_btn.clicked.connect(self.toggle_boost)
+        ml.addWidget(self.boost_btn)
+        ml.addSpacing(20)
+        ml.addWidget(QLabel("ファンモード:"))
+        self.fan_combo = QComboBox()
+        self.fan_combo.addItems(read_sysfs("available_fan_modes", "auto").split())
+        self.fan_combo.setToolTip(
+            "実測ではこの機種で 3 モードとも挙動が同一だった。"
+            "0xd4 の値は変わるが制御には反映されず、常にカーブが優先される。"
+            "silent でもファンは停止しない。")
+        self.fan_combo.activated.connect(
+            lambda: self.set_mode("fan_mode", self.fan_combo.currentText()))
+        ml.addWidget(self.fan_combo)
+        ml.addWidget(QLabel("性能モード:"))
+        self.shift_combo = QComboBox()
+        self.shift_combo.addItem(DEFAULT_SHIFT)   # 0xc0。msi-ec の一覧にはない
+        self.shift_combo.addItems(read_sysfs("available_shift_modes", "").split())
+        self.shift_combo.setToolTip(
+            "実測: デフォルト/turbo = 36W, comfort = 20W, eco = 10W")
+        self.shift_combo.activated.connect(self.on_shift_selected)
+        ml.addWidget(self.shift_combo)
+        ml.addStretch()
+        fan.addWidget(mbox)
+
+        abox = QGroupBox("高温時の自動 Cooler Boost")
+        al = QHBoxLayout(abox)
+        self.ab_enable = QCheckBox("有効にする")
+        al.addWidget(self.ab_enable)
+        al.addSpacing(12)
+        al.addWidget(QLabel("作動:"))
+        self.ab_on = QSpinBox(); self.ab_on.setRange(50, 100); self.ab_on.setSuffix(" ℃ 以上")
+        al.addWidget(self.ab_on)
+        al.addWidget(QLabel("解除:"))
+        self.ab_off = QSpinBox(); self.ab_off.setRange(40, 99); self.ab_off.setSuffix(" ℃ 以下")
+        al.addWidget(self.ab_off)
+        ab_btn = QPushButton("保存")
+        ab_btn.clicked.connect(self.apply_autoboost)
+        al.addWidget(ab_btn)
+        al.addStretch()
+        fan.addWidget(abox)
+        self.load_autoboost()
+
+        gbox = QGroupBox("充電状況")
+        gl = QVBoxLayout(gbox)
+        self.bar = BatteryBar()
+        gl.addWidget(self.bar)
+        self.bat_state = QLabel("—")
+        gl.addWidget(self.bat_state)
+        bat.addWidget(gbox)
+
+        bbox = QGroupBox("充電上限")
+        bl = QVBoxLayout(bbox)
+        self.bat_health = QLabel("—")
+        bl.addWidget(self.bat_health)
+
+        cl2 = QHBoxLayout()
+        cl2.addWidget(QLabel("充電上限:"))
+        self.chg_spin = QSpinBox()
+        self.chg_spin.setRange(40, 100)          # msi-ec は10〜100を受けるが、40未満は実用外
+        self.chg_spin.setSuffix(" %")
+        self.chg_spin.setToolTip(
+            "EC が保持するため OS を問わず有効。充電はここで止まり、"
+            "10ポイント下回ると再開する（開始しきい値は上限から自動で決まる）。")
+        cl2.addWidget(self.chg_spin)
+        apply_chg = QPushButton("適用")
+        apply_chg.clicked.connect(lambda: self.set_charge_limit(self.chg_spin.value()))
+        cl2.addWidget(apply_chg)
+        cl2.addSpacing(12)
+        for v, label in CHARGE_PRESETS:
+            b = QPushButton(label)
+            b.clicked.connect(lambda _, x=v: self.set_charge_limit(x))
+            cl2.addWidget(b)
+        cl2.addStretch()
+        bl.addLayout(cl2)
+        bat.addWidget(bbox)
+
+        bnote = QLabel(
+            "※ 充電上限は EC が保持するため OS を問わず有効。上限で充電が止まり、"
+            "そこから10ポイント下回ると再開する（開始しきい値は上限から自動で決まる）。\n"
+            "※ 高い充電率で“留まる”ことが劣化を早める。外出前に上げたら帰宅後は 60% に戻す。"
+            "一時的に 100% を通過する分の負担は軽微。\n"
+            "※ 満充電容量は残量計の推定値だが、2026-09-01 に実放電（98→15%）で"
+            "積分した実測値と 1% 以内で一致しており、信頼してよい。")
+        bnote.setWordWrap(True)
+        bnf = bnote.font(); bnf.setPointSize(8); bnote.setFont(bnf)
+        bnote.setFrameShape(QFrame.Shape.StyledPanel)
+        bat.addWidget(bnote)
+        bat.addStretch()
+
+        note = QLabel(
+            "※ 最終温度点より上はカーブが効きません（グラフの赤い帯）。"
+            "その領域では EC の既定動作に戻り、Cooler Boost も効かなくなります。"
+            "最終点は 100℃ にして全域を覆ってください。\n"
+            "※ 「報告回転」は EC が指令している値で、実回転そのものではありません。"
+            "下降時はヒステリシスで数段遅れて追従します。\n"
+            "※ EC はカーブを補間しません。現在温度より上にある最初の温度点を探し、"
+            "その点の速度をそのまま出します（例: 上の設定で 65℃ なら 70℃ 欄の速度）。"
+            "グラフの階段はこの挙動をそのまま表しています。\n"
+            "※ 下降時は約5℃のヒステリシスがあり、一段下に落ちるまで速度を保ちます。\n"
+            "※ Cooler Boost はカーブを迂回してファンを全開にします。効き始めるまで約20秒かかり、"
+            "その間も「報告回転」の数値は変わりません（EC がカーブ上の指示値を返すため）。"
+            "実際に効いているかは温度の低下で判断してください。")
+        note.setWordWrap(True)
+        nf = note.font(); nf.setPointSize(8); note.setFont(nf)
+        note.setFrameShape(QFrame.Shape.StyledPanel)
+        fan.addWidget(note)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
+        self.setMinimumSize(520, 400)
+
+        self.build_tray()
+
+        # 残り時間の推定に使う電流の履歴。瞬時値は揺れが大きいので中央値で均す。
+        self.current_hist = deque(maxlen=20)
+
+        self.reload_curve()
+        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh)
+        self.timer.start(1000)
+        self.refresh()
+
+    # --- 同期 ---
+    # --- システムトレイ ---
+    def build_tray(self):
+        self.base_icon = app_icon()
+        self.tray_key = None           # 同じ絵を作り直さないための前回値
+        self.tray = QSystemTrayIcon(self.base_icon, self)
+        menu = QMenu()
+
+        self.act_show = QAction("ウィンドウを表示", self)
+        self.act_show.triggered.connect(self.toggle_window)
+        menu.addAction(self.act_show)
+        menu.addSeparator()
+
+        self.act_boost = QAction("Cooler Boost", self, checkable=True)
+        self.act_boost.triggered.connect(
+            lambda on: self.set_mode("cooler_boost", "on" if on else "off"))
+        menu.addAction(self.act_boost)
+
+        shift_menu = menu.addMenu("性能モード")
+        self.shift_acts = {}
+        for name in [DEFAULT_SHIFT] + read_sysfs("available_shift_modes", "").split():
+            a = QAction(name, self, checkable=True)
+            a.triggered.connect(lambda _, v=name: self.tray_set_shift(v))
+            shift_menu.addAction(a)
+            self.shift_acts[name] = a
+
+        menu.addSeparator()
+        quit_act = QAction("終了", self)
+        quit_act.triggered.connect(QApplication.quit)
+        menu.addAction(quit_act)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda r: self.toggle_window()
+            if r == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.show()
+
+    def toggle_window(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def tray_set_shift(self, val):
+        if val == DEFAULT_SHIFT:
+            err = run_helper("shift_reset")
+        else:
+            err = run_helper("shift_mode", val)
+        if err:
+            self.tray.showMessage("失敗", err, QSystemTrayIcon.MessageIcon.Warning)
+
+    def closeEvent(self, e):
+        """× ではアプリを終了せず、トレイへ格納する。終了はトレイのメニューから。"""
+        if self.tray.isVisible():
+            e.ignore()
+            self.hide()
+        else:
+            e.accept()
+
+    def curve_to_spins(self):
+        for i in range(6):
+            self.t_spin[i].blockSignals(True); self.s_spin[i].blockSignals(True)
+            self.t_spin[i].setValue(self.curve.temps[i])
+            self.s_spin[i].setValue(self.curve.speeds[i])
+            self.t_spin[i].blockSignals(False); self.s_spin[i].blockSignals(False)
+        self.update_bands()
+
+    def spins_to_curve(self):
+        self.curve.temps = [w.value() for w in self.t_spin]
+        self.curve.speeds = [w.value() for w in self.s_spin]
+        self.curve.update()
+        self.update_bands()
+
+    def update_bands(self):
+        t = self.curve.temps
+        for i in range(6):
+            self.band_lbl[i].setText(
+                f"〜{t[0]}℃" if i == 0 else f"{t[i - 1]}〜{t[i]}℃")
+
+    def load_preset(self, name):
+        self.curve.set_curve(*PRESETS[name])
+        self.curve_to_spins()
+
+    def reload_curve(self):
+        c = read_curve()
+        if c is None:
+            QMessageBox.warning(self, "読み取り失敗",
+                                "EC を読めません。msi-ec が debug モードで\n"
+                                "読み込まれているか確認してください。")
+            return
+        self.curve.set_curve(*c)
+        self.curve_to_spins()
+
+    # --- 書き込み ---
+    def apply(self, save):
+        if self.curve.temps[5] < 100:
+            if QMessageBox.warning(
+                self, "最終温度点が低すぎます",
+                f"最終温度点が {self.curve.temps[5]}℃ になっています。\n\n"
+                "これより上の温度域は EC のカーブ制御から外れ、既定動作"
+                "（実測では 70%）に戻ります。その状態では Cooler Boost も"
+                "効かなくなることを確認しています。\n\n"
+                "本機の Tjmax は 100℃ で、性能モードが デフォルト / turbo の"
+                "ときは実測で 95℃ に張り付きます。穴を残さないために最終温度点は"
+                "100℃ にしておくことを強く勧めます。\n\nこのまま適用しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        payload = json.dumps({"temps": self.curve.temps,
+                              "speeds": self.curve.speeds, "save": save})
+        err = run_helper("apply", payload)
+        if err:
+            QMessageBox.critical(self, "適用できませんでした", err)
+        else:
+            self.reload_curve()
+
+    def to_stock(self):
+        if QMessageBox.question(
+                self, "確認",
+                "カーブをデフォルト (50/60/70/80/90/95℃ → 0/40/50/70/70/70%) に戻し、\n"
+                "起動時の自動適用も解除します。よろしいですか？"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        err = run_helper("stock")
+        if err:
+            QMessageBox.critical(self, "失敗", err)
+        self.reload_curve()
+
+    def load_autoboost(self):
+        try:
+            with open("/etc/msi-fan/autoboost.json") as f:
+                c = json.load(f)
+        except (OSError, ValueError):
+            c = {}
+        self.ab_enable.setChecked(bool(c.get("enabled", False)))
+        self.ab_on.setValue(int(c.get("on_temp", 85)))
+        self.ab_off.setValue(int(c.get("off_temp", 70)))
+
+    def apply_autoboost(self):
+        if self.ab_off.value() >= self.ab_on.value():
+            QMessageBox.warning(self, "設定が不正です",
+                                "解除温度は作動温度より低くしてください。")
+            return
+        err = run_helper("autoboost", json.dumps({
+            "enabled": self.ab_enable.isChecked(),
+            "on_temp": self.ab_on.value(),
+            "off_temp": self.ab_off.value()}))
+        if err:
+            QMessageBox.critical(self, "失敗", err)
+
+    def toggle_boost(self):
+        want = "on" if self.boost_btn.isChecked() else "off"
+        err = run_helper("cooler_boost", want)
+        if err:
+            QMessageBox.critical(self, "失敗", err)
+
+    def set_charge_limit(self, value):
+        err = run_helper("charge_limit", str(value))
+        if err:
+            QMessageBox.critical(self, "失敗", err)
+
+    def on_shift_selected(self):
+        val = self.shift_combo.currentText()
+        if val == DEFAULT_SHIFT:
+            err = run_helper("shift_reset")   # 0xd2 に 0xc0 を書き戻す専用経路
+        else:
+            err = run_helper("shift_mode", val)
+        if err:
+            QMessageBox.critical(self, "失敗", err)
+
+    def set_mode(self, attr, val):
+        err = run_helper(attr, val)
+        if err:
+            QMessageBox.critical(self, "失敗", err)
+
+    @staticmethod
+    def _sync_combo(combo, value):
+        """操作中でなければ、コンボの選択を実際の状態に合わせる。"""
+        if combo.hasFocus():
+            return
+        i = combo.findText(value)
+        if i >= 0 and i != combo.currentIndex():
+            combo.setCurrentIndex(i)
+
+    # --- 定期更新 ---
+    def refresh(self):
+        t = read_sysfs("cpu/realtime_temperature")
+        s = read_sysfs("cpu/realtime_fan_speed")
+        boost = read_sysfs("cooler_boost")
+        self.lbl["temp"].setText(f"{t} ℃")
+        self.lbl["fan"].setText(f"{s} %")
+        self.lbl["mode"].setText(read_sysfs("fan_mode"))
+        self.lbl["boost"].setText("ON" if boost == "on" else "off")
+        shift = shift_label(read_sysfs("shift_mode"))
+        self.lbl["shift"].setText(shift)
+        self._sync_combo(self.shift_combo, shift)
+        self._sync_combo(self.fan_combo, read_sysfs("fan_mode"))
+        self.lbl["power"].setText(read_power())
+
+        b = read_battery()
+        self.bar.set_state(b["capacity"], b["limit"] or 100, b["status"])
+        st = {"Charging": "充電中", "Discharging": "放電中",
+              "Not charging": "充電停止（上限に到達）", "Full": "満充電"}.get(
+                  b["status"], b["status"])
+        self.bat_state.setText(f"{st}")
+        if b["design"]:
+            self.bat_health.setText(
+                f"満充電容量 {b['full']/1000:.0f} mAh / 設計 {b['design']/1000:.0f} mAh"
+                f"　→　健全度 {b['health']:.1f}%")
+        if not self.chg_spin.hasFocus() and b["limit"]:
+            self.chg_spin.setValue(b["limit"])
+
+        self.lbl["temp"].setStyleSheet(
+            "color:#e8663d" if t.isdigit() and int(t) >= 85 else "")
+        on = boost == "on"
+        self.lbl["boost"].setStyleSheet("color:#e8663d" if on else "")
+        self.boost_btn.setText("Cooler Boost 作動中（押すと切る）" if on
+                               else "Cooler Boost を入れる")
+        self.boost_btn.setStyleSheet(
+            "font-weight:bold; color:#e8663d" if on else "")
+        self.boost_btn.setToolTip(
+            "自動 Cooler Boost が有効なので、しきい値を跨ぐと"
+            "この手動操作は上書きされます"
+            if self.ab_enable.isChecked() else
+            "ファンをカーブの 100% よりさらに上で回します（効き始めまで約20秒）")
+        if t.isdigit():
+            self.curve.cur_temp = int(t)
+        if s.isdigit():
+            self.curve.cur_speed = int(s)
+        self.curve.update()
+        if not self.boost_btn.isDown():
+            self.boost_btn.setChecked(on)
+
+        self.update_tray(t, s, shift, b, boost)
+
+    def runtime_text(self, b):
+        """残り稼働時間。charge_now / current_now で求まるが、瞬時電流は
+        揺れが大きいので直近サンプルの中央値を使う。"""
+        if b["status"] != "Discharging":
+            return None
+        if b["current"] > 0:
+            self.current_hist.append(b["current"])
+        if len(self.current_hist) < 3:
+            return "計測中…"
+        cur = statistics.median(self.current_hist)
+        if cur <= 0 or not b["charge_now"]:
+            return None
+        h = b["charge_now"] / cur
+        return f"{int(h)}時間{int((h % 1) * 60):02d}分"
+
+    def update_tray(self, temp, fan, shift, b, boost):
+        st = {"Charging": "充電中", "Discharging": "放電中",
+              "Not charging": "充電停止", "Full": "満充電"}.get(b["status"], b["status"])
+        lines = [
+            "MSI ファン制御",
+            f"CPU {temp}℃ / ファン {fan}%" + ("  [Boost]" if boost == "on" else ""),
+            f"性能 {shift} / 消費 {read_power()}",
+            f"電池 {b['capacity']}%（{st}）",
+        ]
+        rt = self.runtime_text(b)
+        if rt:
+            lines.append(f"残り 約{rt}")
+        else:
+            lines.append(f"充電上限 {b['limit']}%")
+        self.tray.setToolTip("\n".join(lines))
+
+        # 値が変わったときだけアイコンを描き直す（毎秒作り直すと無駄）
+        key = (b["capacity"], b["limit"] or 100, b["status"])
+        if key != self.tray_key:
+            self.tray_key = key
+            self.tray.setIcon(battery_ring_icon(self.base_icon, *key))
+
+        if self.act_boost.isChecked() != (boost == "on"):
+            self.act_boost.setChecked(boost == "on")
+        for name, a in self.shift_acts.items():
+            a.setChecked(name == shift)
+        self.act_show.setText("ウィンドウを隠す" if self.isVisible() else "ウィンドウを表示")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    # × はトレイへの格納なので、ウィンドウが無くなっても終了させない。
+    app.setQuitOnLastWindowClosed(False)
+    # Wayland ではウィンドウと .desktop の対応付けに app_id を使う。
+    # 実行ファイル名 (msi-fan-gui) と .desktop 名 (msi-fan) が違うため、
+    # 明示しないとタスクバーがアイコンを引けない。
+    QApplication.setDesktopFileName("msi-fan")
+    app.setWindowIcon(app_icon())
+    w = MainWindow()
+    w.resize(760, 640)
+    # 常駐用途では --tray で起動するとウィンドウを出さずトレイだけに入る。
+    if "--tray" not in sys.argv:
+        w.show()
+    sys.exit(app.exec())

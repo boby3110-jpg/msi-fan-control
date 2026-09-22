@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""MSI ファン監視デーモン。
+
+2 つの仕事をする。
+
+1. 実測消費電力を /run/msi-fan/power に公開する。RAPL の energy_uj は
+   root しか読めないため、GUI が自力では取得できない。性能モード
+   (0xd2) は RAPL の上限値を変えずに実電力を抑えるので、この実測値
+   でしか効果を確認できない。
+2. 設定が有効なら、高温時に Cooler Boost を入れる。カーブの 100% は
+   ファンの物理的な全開ではなく、Boost はさらに上を回すため。
+"""
+import json
+import os
+import time
+
+D = "/sys/devices/platform/msi-ec"
+RAPL = "/sys/class/powercap/intel-rapl/intel-rapl:0"
+CONF = "/etc/msi-fan/autoboost.json"
+RUN_DIR = "/run/msi-fan"
+POWER_FILE = f"{RUN_DIR}/power"
+DEFAULT = {"enabled": False, "on_temp": 85, "off_temp": 70}
+INTERVAL = 2.0
+
+
+def rd(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_conf():
+    try:
+        with open(CONF) as f:
+            return {**DEFAULT, **json.load(f)}
+    except (OSError, ValueError):
+        return dict(DEFAULT)
+
+
+def set_boost(val):
+    try:
+        with open(f"{D}/cooler_boost", "w") as f:
+            f.write(val)
+    except OSError:
+        pass
+
+
+def read_energy():
+    v = rd(f"{RAPL}/energy_uj")
+    return int(v) if v and v.isdigit() else None
+
+
+def publish(watts):
+    tmp = f"{POWER_FILE}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(f"{watts:.1f}")
+        os.replace(tmp, POWER_FILE)
+        os.chmod(POWER_FILE, 0o644)
+    except OSError:
+        pass
+
+
+def main():
+    os.makedirs(RUN_DIR, exist_ok=True)
+    os.chmod(RUN_DIR, 0o755)
+    max_e = rd(f"{RAPL}/max_energy_range_uj")
+    max_e = int(max_e) if max_e and max_e.isdigit() else 0
+
+    state = None                       # 直近に自分が指示した Boost 状態
+    prev_e, prev_t = read_energy(), time.monotonic()
+
+    while True:
+        time.sleep(INTERVAL)
+
+        # --- 実測電力 ---
+        e, t = read_energy(), time.monotonic()
+        if e is not None and prev_e is not None and t > prev_t:
+            de = e - prev_e if e >= prev_e else e + max_e - prev_e
+            publish(de / 1e6 / (t - prev_t))
+        prev_e, prev_t = e, t
+
+        # --- 自動 Cooler Boost ---
+        c = read_conf()
+        if not c["enabled"]:
+            if state is True:
+                set_boost("off")
+            state = None
+            continue
+
+        temp = rd(f"{D}/cpu/realtime_temperature")
+        if not (temp and temp.isdigit()):
+            continue
+        temp = int(temp)
+        # 作動・解除でしきい値を分けて、境界での往復を防ぐ
+        if temp >= c["on_temp"] and state is not True:
+            set_boost("on")
+            state = True
+        elif temp <= c["off_temp"] and state is not False:
+            set_boost("off")
+            state = False
+
+
+if __name__ == "__main__":
+    main()

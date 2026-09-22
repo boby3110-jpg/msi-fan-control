@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""msi-fan-helper — 特権側。EC の許可された番地のみを書き換える。
+
+GUI から pkexec 経由で呼ばれる。書き込み可能な番地をホワイトリストで
+限定しているため、GUI 側に不具合があっても EC の他領域は触れない。
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+
+D = "/sys/devices/platform/msi-ec"
+
+# EC の生レジスタへ書き込むため、番地の配置が実測で確認できた機種に限定する。
+# 別機種では同じ番地が別の機能である可能性があり、無検証で書くと EC を壊しうる。
+# 追加するには、その機種で ec_dump を取り、温度点・速度点の番地を確認すること。
+SUPPORTED_BOARDS = {
+    "MS-13Q1": "MSI Prestige 13 Evo A12M (EC 13Q1EMS1.102 / .503)",
+}
+
+
+def find_battery():
+    """電池の sysfs パス。BAT0 か BAT1 かは機種で違うので type で探す。"""
+    for p in sorted(glob.glob("/sys/class/power_supply/*")):
+        try:
+            with open(f"{p}/type") as f:
+                if f.read().strip() == "Battery":
+                    return p
+        except OSError:
+            pass
+    return "/sys/class/power_supply/BAT0"
+
+
+# 充電しきい値は msi-ec が power_supply 側に生やすため、平台デバイス配下には無い。
+BAT = find_battery()
+CONF = "/etc/msi-fan/curve.json"
+AUTO_CONF = "/etc/msi-fan/autoboost.json"
+MODE_CONF = "/etc/msi-fan/mode.json"
+
+TEMP_ADDRS = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F]
+SPEED_ADDRS = [0x72, 0x73, 0x74, 0x75, 0x76, 0x77]
+ALLOWED = set(TEMP_ADDRS + SPEED_ADDRS)
+
+# 「デフォルト」として戻す先のカーブ。
+# MS-13Q1 (13Q1EMS1.503) で最初に読み出した値だが、MSI の出荷値とは限らない
+# （同型機 .102 のダンプでは上位2点が 90/100 だった。Windows の MSI Center で
+# 変更された可能性がある）。出荷値が要るなら自機の初回ダンプを控えておくこと。
+STOCK_TEMPS = [50, 60, 70, 80, 90, 95]
+STOCK_SPEEDS = [0, 40, 50, 70, 70, 70]
+
+
+def die(msg):
+    print(f"エラー: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def check_board():
+    """EC の生レジスタに触る前に、検証済みの機種か確認する。"""
+    try:
+        with open("/sys/class/dmi/id/board_name") as f:
+            board = f.read().strip()
+    except OSError:
+        die("ベースボード名を読めません (/sys/class/dmi/id/board_name)")
+    if board not in SUPPORTED_BOARDS:
+        die(f"未検証の機種です: {board}\n"
+            "  この操作は EC の生レジスタへ書き込みます。番地の配置は次の機種でのみ"
+            "実測確認されています:\n" +
+            "".join(f"    {k}: {v}\n" for k, v in SUPPORTED_BOARDS.items()) +
+            "  他機種で使うには、ec_dump で番地を検証してから SUPPORTED_BOARDS に追加してください。")
+
+
+def ec_set(addr, val):
+    if addr not in ALLOWED:
+        die(f"0x{addr:02x} は書き込み許可リストにありません")
+    if not 0 <= val <= 0xFF:
+        die(f"値 {val} が範囲外です")
+    with open(f"{D}/debug/ec_set", "w") as f:
+        f.write(f"{addr:02x}={val:02x}")   # ec_set は 6 バイト以内のみ受理
+
+
+def write_attr(name, val):
+    with open(f"{D}/{name}", "w") as f:
+        f.write(val)
+
+
+def validate(temps, speeds):
+    if len(temps) != 6 or len(speeds) != 6:
+        die("温度・速度とも 6 点必要です")
+    for t in temps:
+        if not 30 <= t <= 105:
+            die(f"温度 {t}℃ が範囲外です (30-105)")
+    for s in speeds:
+        if not 0 <= s <= 100:
+            die(f"速度 {s}% が範囲外です (0-100)")
+    if temps != sorted(temps) or len(set(temps)) != 6:
+        die("温度は昇順かつ重複なしである必要があります")
+    if speeds != sorted(speeds):
+        die("速度は非減少である必要があります")
+
+
+def apply_curve(temps, speeds):
+    validate(temps, speeds)
+    for a, v in zip(TEMP_ADDRS, temps):
+        ec_set(a, v)
+    for a, v in zip(SPEED_ADDRS, speeds):
+        ec_set(a, v)
+
+
+def save_mode(val):
+    os.makedirs(os.path.dirname(MODE_CONF), exist_ok=True)
+    with open(MODE_CONF, "w") as f:
+        json.dump({"shift_mode": val}, f, indent=2)
+    os.chmod(MODE_CONF, 0o644)
+
+
+def save(temps, speeds):
+    validate(temps, speeds)
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        json.dump({"temps": temps, "speeds": speeds}, f, indent=2)
+
+
+def main():
+    if os.geteuid() != 0:
+        die("root で実行してください（GUI からは pkexec 経由で呼ばれます）")
+    if not os.path.exists(f"{D}/debug/ec_set"):
+        die("msi-ec が debug モードで読み込まれていません "
+            "(/etc/modprobe.d/msi-ec.conf を確認してください)")
+
+    if len(sys.argv) < 2:
+        die("引数がありません")
+    cmd = sys.argv[1]
+
+    if cmd in ("apply", "stock", "restore", "shift_reset"):
+        check_board()          # 以下は EC の生レジスタに書く
+
+    if cmd == "apply":
+        d = json.loads(sys.argv[2])
+        apply_curve(d["temps"], d["speeds"])
+        if d.get("save"):
+            save(d["temps"], d["speeds"])
+    elif cmd == "stock":
+        apply_curve(STOCK_TEMPS, STOCK_SPEEDS)
+        if os.path.exists(CONF):
+            os.remove(CONF)
+    elif cmd == "restore":          # systemd が起動時に呼ぶ
+        if os.path.exists(CONF):
+            with open(CONF) as f:
+                d = json.load(f)
+            apply_curve(d["temps"], d["speeds"])
+        if os.path.exists(MODE_CONF):
+            try:
+                with open(MODE_CONF) as f:
+                    m = json.load(f)
+                if m.get("shift_mode"):
+                    write_attr("shift_mode", m["shift_mode"])
+            except (OSError, ValueError):
+                pass
+    elif cmd == "charge_limit":
+        # msi-ec の set_end_threshold は 10〜100 のみ受理する。
+        # charge_control_start_threshold は end-10 の派生値で実体が無いため触らない。
+        v = int(sys.argv[2])
+        if not 10 <= v <= 100:
+            die(f"充電上限 {v}% が範囲外です (10-100)")
+        with open(f"{BAT}/charge_control_end_threshold", "w") as f:
+            f.write(str(v))
+    elif cmd == "shift_reset":
+        # 0xd2 は通常のホワイトリスト外。出荷値 0xc0 への復帰に限って許可する。
+        # msi-ec の選択肢は turbo/eco/comfort の3つだけで 0xc0 を書けないため。
+        with open(f"{D}/debug/ec_set", "w") as f:
+            f.write("d2=c0")
+        if os.path.exists(MODE_CONF):
+            os.remove(MODE_CONF)
+    elif cmd == "autoboost":
+        d = json.loads(sys.argv[2])
+        on_t, off_t = int(d["on_temp"]), int(d["off_temp"])
+        if not 40 <= off_t < on_t <= 100:
+            die("しきい値が不正です (40 ≦ 解除温度 < 作動温度 ≦ 100)")
+        enabled = bool(d["enabled"])
+        os.makedirs(os.path.dirname(AUTO_CONF), exist_ok=True)
+        with open(AUTO_CONF, "w") as f:
+            json.dump({"enabled": enabled, "on_temp": on_t, "off_temp": off_t},
+                      f, indent=2)
+        os.chmod(AUTO_CONF, 0o644)
+        # デーモンは常駐させたままにする（実測電力の公開も担うため）。
+        # 作動する・しないはデーモンが設定ファイルを読んで判断する。
+        subprocess.run(["systemctl", "enable", "--now",
+                        "msi-fan-autoboost.service"], check=False)
+    elif cmd in ("fan_mode", "shift_mode", "cooler_boost"):
+        write_attr(cmd, sys.argv[2])
+        if cmd == "shift_mode":
+            save_mode(sys.argv[2])   # 起動時に復元する
+    else:
+        die(f"不明なコマンド: {cmd}")
+
+
+if __name__ == "__main__":
+    main()
