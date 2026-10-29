@@ -48,16 +48,33 @@ and systemd units that restore the settings at boot.
   [BeardOverflow/msi-ec#819](https://github.com/BeardOverflow/msi-ec/pull/819).
 - msi-ec built with DKMS and loaded with `debug=true` (the curve is written
   through its `debug/ec_set` interface).
-- Debian 13 / KDE Plasma 6 on Wayland is what this was written against.
-  Other distributions should work; the packaging assumptions are
-  `apt`, `systemd`, `polkit`, `python3-pyqt6`.
+- A distribution with `systemd` and `polkit`. `bootstrap.sh` handles:
+
+  | family | package manager | status |
+  |---|---|---|
+  | Debian | apt | **tested** (Debian 13, KDE Plasma 6 on Wayland) |
+  | Ubuntu and other Debian derivatives | apt | untested |
+  | openSUSE Tumbleweed / Leap | zypper | untested |
+
+  Everything past `bootstrap.sh` is distribution-neutral: sysfs, systemd
+  units, udev rules and a polkit policy.
 
 ## Install
 
 ```bash
-sudo bash bootstrap.sh   # deps, msi-ec via DKMS, /etc/modprobe.d entry, EC check
-sudo bash install.sh     # GUI, helper, polkit policy, units, icons, autostart
+bash bootstrap.sh --dry-run   # optional: show what it would do, no root needed
+sudo bash bootstrap.sh        # deps, msi-ec via DKMS, /etc/modprobe.d entry, EC check
+sudo bash install.sh          # GUI, helper, polkit policy, units, icons, autostart
 ```
+
+> **⚠️ The kernel's own msi-ec is not enough.** Mainline kernels ship an
+> in-tree `msi-ec` (Debian's is 4.8 KB), and it has **no `firmware=`
+> parameter, no `debug=` mode and no `CONF_G2_3`** — this tool cannot work
+> with it. `bootstrap.sh` therefore checks for the `firmware` parameter
+> rather than for the module's mere presence, builds the upstream version
+> through DKMS when it is missing, and finally verifies that
+> `debug/ec_set` exists. If you ever see the in-tree one loaded instead,
+> `modinfo -n msi-ec` should point under `/updates/`.
 
 `bootstrap.sh` aborts if the board is not `MS-13Q1`, and warns if the EC
 firmware doesn't start with `13Q1EMS1` (a BIOS update could move the
@@ -65,6 +82,20 @@ registers). `install.sh` is idempotent and registers the GUI to autostart
 in the tray for the invoking user.
 
 Settings live in `/etc/msi-fan/` and are not part of this repository.
+
+**On openSUSE**, two things differ:
+
+- Polkit's admin identity is `root`, so the GUI asks for the **root
+  password** rather than your own when applying settings.
+- Tumbleweed updates the kernel often, and every update makes DKMS rebuild
+  msi-ec. `bootstrap.sh` enables `dkms.service` so that happens at boot.
+  If a new kernel ever breaks the build, `msi-fan-restore.service` will show
+  as failed and you can boot the previous kernel, which openSUSE keeps
+  installed.
+
+If Secure Boot is enabled, the DKMS module needs signing and MOK
+enrollment before it will load; `bootstrap.sh` warns about this but does
+not do it for you.
 
 ## Architecture
 
@@ -188,9 +219,22 @@ systemd ユニットを載せたものです。
 ### 導入
 
 ```bash
-sudo bash bootstrap.sh   # 依存パッケージ、msi-ec (DKMS)、modprobe.d、EC 照合
-sudo bash install.sh     # GUI・ヘルパー・polkit・ユニット・アイコン・自動起動
+bash bootstrap.sh --dry-run   # 任意: 何をするかだけ表示（root 不要）
+sudo bash bootstrap.sh        # 依存パッケージ、msi-ec (DKMS)、modprobe.d、EC 照合
+sudo bash install.sh          # GUI・ヘルパー・polkit・ユニット・アイコン・自動起動
 ```
+
+`bootstrap.sh` は Debian 系（apt）と openSUSE 系（zypper）に対応。
+動作確認済みは **Debian 13** のみで、Ubuntu・openSUSE は未検証です。
+
+> **⚠️ カーネル同梱の msi-ec では動きません。** カーネルには最初から in-tree 版の
+> msi-ec が入っていますが、**`firmware=` も `debug=` も `CONF_G2_3` も持っていません**。
+> `bootstrap.sh` は「モジュールがあるか」ではなく「`firmware` パラメータがあるか」で
+> 判定し、無ければ DKMS で上流版を導入し、最後に `debug/ec_set` の存在を確認します。
+
+openSUSE では、設定適用時の認証が**root のパスワード**になります（polkit の管理者が
+root のため）。また Tumbleweed はカーネル更新が頻繁なので、`dkms.service` を有効化して
+起動時に msi-ec を再ビルドさせています。
 
 設定値は `/etc/msi-fan/` に保存され、このリポジトリには含まれません。
 
